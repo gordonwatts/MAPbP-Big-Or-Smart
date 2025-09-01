@@ -1,41 +1,41 @@
 # Plot the ETmiss of all events in the rucio dataset mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697.
 
-## Model gpt-5-mini
+## Model gpt-5
 
 <details><summary>Run 1</summary>
 <div style="margin-left: 1em;">
 
 
-- Fetched the event-level MissingET (met) from the specified PHYSLITE rucio dataset using ServiceX (converted MeV -> GeV inside the query).
-- Loaded the result into an Awkward Array (NFiles=1 used for the ServiceX deliver — you can run more files yourself if desired).
-- Built a 1D histogram (50 bins, 0–200 GeV) with hist, plotted using mplhep ATLAS style, and saved the plot to "met_hist.png".
+- Constructed a FuncADL query on DAOD_PHYSLITE to select event-level missing transverse energy (ETmiss) and converted it to GeV in the query.
+- Used ServiceX to deliver data from the specified Rucio dataset (NFiles=1, as recommended) and converted the result into an Awkward Array.
+- Filled a 1D histogram (50 bins, 0–200 GeV) of ETmiss using Hist, avoiding Python lists and operating directly on Awkward/Numpy arrays.
+- Plotted the histogram with mplhep’s ATLAS style and saved it to a PNG file named etmiss.png.
+- Note: This example uses a single file for a quick test. When ready, you can increase NFiles yourself.
 
 ```python
-# Fetch MissingET from the specified PHYSLITE dataset, histogram it, and save a PNG.
+import awkward as ak
+import numpy as np
+import matplotlib.pyplot as plt
+import mplhep as hep
+from hist import Hist
+
 from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
 from servicex_analysis_utils import to_awk
 from servicex import deliver, ServiceXSpec, Sample, dataset
-import awkward as ak
-from hist import Hist
-import matplotlib.pyplot as plt
-import mplhep as hep
 
-# Build the FuncADL query: get the event-level MissingET and convert MeV -> GeV
+# Define the Rucio dataset DID exactly as requested
+ds_name = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+
+# Build the query: event-level ETmiss (convert MeV -> GeV)
 base_query = FuncADLQueryPHYSLITE()
-met_query = (
-    base_query
-    .Select(lambda e: e.MissingET().First())
-    .Select(lambda m: {"met": m.met() / 1000.0})  # convert MeV -> GeV
+met_query = base_query.Select(
+    lambda e: {
+        "met": e.MissingET().First().met() / 1000.0,  # GeV
+    }
 )
 
-# Dataset name provided by the user (copy carefully)
-ds_name = (
-    "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv."
-    "DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
-)
-
-# Execute the fetch via ServiceX: use NFiles=1 per guidelines
-result = to_awk(
+# Deliver the data from ServiceX (use NFiles=1 as a quick test)
+results = to_awk(
     deliver(
         ServiceXSpec(
             Sample=[
@@ -46,31 +46,32 @@ result = to_awk(
                     Query=met_query,
                 )
             ]
-        ),
+        )
     )
 )
 
-# Extract the awkward array from the returned dict
-met_data = result["met_fetch"]  # awkward array, field 'met' in GeV
+data = results["met_fetch"]
+met = data.met  # Awkward Array of ETmiss per event (GeV)
 
-# Build a histogram: 50 bins from 0 to 200 GeV (reasonable MET range)
+# Create and fill histogram: 50 bins from 0 to 200 GeV
 h = (
-    Hist.new.Reg(50, 0.0, 200.0, name="met", label="Missing $E_T$ [GeV]")
-    .Int64()
+    Hist.new
+        .Reg(50, 0.0, 200.0, name="met", label=r"$E_{T}^{\mathrm{miss}}$ [GeV]")
+        .Int64()
 )
+h.fill(met=ak.to_numpy(met))
 
-# Fill histogram using the awkward array (use the 'met' field)
-h.fill(met=met_data["met"])
-
-# Plot using mplhep ATLAS style and save to PNG
+# Plot
 plt.style.use(hep.style.ATLAS)
 fig, ax = plt.subplots()
-h.plot(ax=ax, histtype="fill", edgecolor="gray", label="PHYSLITE")
-ax.set_xlabel("Missing $E_T$ [GeV]")
-ax.set_ylabel("Counts")
-ax.set_title("Event Missing $E_T$")
+h.plot(histtype="fill", linewidth=1, edgecolor="gray", label="All events")
+ax.set_xlabel(r"$E_{T}^{\mathrm{miss}}$ [GeV]")
+ax.set_ylabel("Events")
+ax.set_title(r"Missing $E_{T}^{\mathrm{miss}}$")
 ax.legend()
-fig.savefig("met_hist.png")
+
+# Save to file
+fig.savefig("etmiss.png")
 plt.close(fig)
 ```
 ### stdout:
@@ -99,42 +100,40 @@ ce8f13a8c0b6: Pulling fs layer
 8f2cf14ad14d: Pulling fs layer
 660b8664e6e1: Pulling fs layer
 eb522b4f7276: Pulling fs layer
-2a1478e0415a: Waiting
-235451d01566: Waiting
-a0831920243c: Waiting
-4f4fb700ef54: Waiting
+8fdd7df8e834: Waiting
 ce8f13a8c0b6: Waiting
 8f2cf14ad14d: Waiting
-8fdd7df8e834: Waiting
 660b8664e6e1: Waiting
+2a1478e0415a: Waiting
+235451d01566: Waiting
 eb522b4f7276: Waiting
+a0831920243c: Waiting
+4f4fb700ef54: Waiting
 0f40319da806: Verifying Checksum
 0f40319da806: Download complete
-8fdd7df8e834: Verifying Checksum
+081f96d6584f: Verifying Checksum
+081f96d6584f: Download complete
 8fdd7df8e834: Download complete
 59e22667830b: Verifying Checksum
 59e22667830b: Download complete
-081f96d6584f: Verifying Checksum
-081f96d6584f: Download complete
 2a1478e0415a: Verifying Checksum
 2a1478e0415a: Download complete
-4f4fb700ef54: Verifying Checksum
-4f4fb700ef54: Download complete
 a0831920243c: Verifying Checksum
 a0831920243c: Download complete
+4f4fb700ef54: Verifying Checksum
+4f4fb700ef54: Download complete
 59e22667830b: Pull complete
 ce8f13a8c0b6: Verifying Checksum
 ce8f13a8c0b6: Download complete
 0f40319da806: Pull complete
 660b8664e6e1: Verifying Checksum
 660b8664e6e1: Download complete
+235451d01566: Verifying Checksum
+235451d01566: Download complete
 081f96d6584f: Pull complete
 8fdd7df8e834: Pull complete
 2a1478e0415a: Pull complete
-eb522b4f7276: Verifying Checksum
 eb522b4f7276: Download complete
-235451d01566: Verifying Checksum
-235451d01566: Download complete
 235451d01566: Pull complete
 a0831920243c: Pull complete
 4f4fb700ef54: Pull complete
@@ -157,7 +156,7 @@ bash: no job control in this shell
 </div></details>
 
 
-![2fc7e91d_gpt-5-mini_met_hist.png](img/2fc7e91d_gpt-5-mini_met_hist.png)
+![2fc7e91d_gpt-5_etmiss.png](img/2fc7e91d_gpt-5_etmiss.png)
 <details><summary>Usage</summary>
 <div style="margin-left: 1em;">
 
@@ -165,14 +164,14 @@ bash: no job control in this shell
 ### LLM Usage
 | Step | Time (sec) | Prompt Tokens | Completion Tokens | Total Tokens | Cost (USD) |
 |---|---|---|---|---|---|
-| Run 1 | 31.48 | 13846 | 1949 | 15795 | $0.01 |
-| **Total** | 31.48 | 13846 | 1949 | 15795 | $0.007 |
+| Run 1 | 40.42 | 13846 | 3114 | 16960 | $0.05 |
+| **Total** | 40.42 | 13846 | 3114 | 16960 | $0.048 |
 
 ### Docker Usage
 | Phase | Elapsed Time (seconds) |
 |-------|--------------|
-| Run 1 | 47.84 |
-| **Total** | **47.84** |
+| Run 1 | 46.01 |
+| **Total** | **46.01** |
 
 </div></details>
 
@@ -180,8 +179,8 @@ bash: no job control in this shell
 ## CSV
 
 Model,Time,PromptTokens,CompletionTokens,TotalTokens,EstimatedCost,Attempts,CodeTime,Result
-gpt-5-mini,31.48,13846,1949,15795,0.007,1,47.84,Success
+gpt-5,40.42,13846,3114,16960,0.048,1,46.01,Success
 ## Summary
 | Model | Time | Prompt Tokens | Completion Tokens | Total Tokens | Estimated Cost | Attempts | Code Time | Result |
 |-----|----|-------------|-----------------|------------|--------------|--------|---------|------|
-| gpt-5-mini | 31.48 | 13846 | 1949 | 15795 | $0.007 | 1 | 47.84 | Success |
+| gpt-5 | 40.42 | 13846 | 3114 | 16960 | $0.048 | 1 | 46.01 | Success |
