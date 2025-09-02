@@ -1,4 +1,4 @@
-# Compare the pT of the highest pT jet in each event in mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697 and mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697 between 100 and 200 GeV.
+# Make stacked histogram of the pT of the highest pT jet in each event in mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697 and mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697 between 100 and 200 GeV.
 
 ## Model gpt-5
 
@@ -6,118 +6,103 @@
 <div style="margin-left: 1em;">
 
 
-- Use ServiceX (FuncADL, PHYSLITE) to fetch, in one call, only the per-event jet pT lists from both rucio datasets (NFiles=1 as required).
-- Convert MeV→GeV at query time; keep event structure so we can compute the leading jet pT with Awkward (ak.argmax along axis=1).
-- Select only events with a valid leading jet, then restrict the leading-jet pT to 100–200 GeV for comparison.
-- Fill two Hist histograms (50 bins, 100–200 GeV), and plot them overlaid with ATLAS style.
-- Save the comparison plot to a PNG file. If you want more than 1 file, run locally with more files by changing NFiles yourself.
+- Fetch jets from both requested DAOD_PHYSLITE datasets using ServiceX (Release 25), filtering at the ServiceX level to keep only jets with pT > 100 GeV, and converting MeV to GeV.
+- Use Awkward Array to compute the leading-jet pT per event (argmax per event), and keep only values within 100–200 GeV for plotting.
+- Build a 1D Hist with a categorical axis for dataset names and fill it with the leading-jet pT values; plot as a stacked filled histogram in ATLAS style.
+- Save the plot to leading_jet_pt_stacked_100_200.png.
+- Note: Only NFiles=1 is fetched per dataset for speed. When you are ready, increase NFiles yourself.
 
 ```python
 import awkward as ak
 import numpy as np
 import matplotlib.pyplot as plt
 import mplhep as hep
+from hist import Hist
 
 from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
 from servicex_analysis_utils import to_awk
 from servicex import deliver, ServiceXSpec, Sample, dataset
 
-def main():
-    # Use ATLAS-like plotting style
-    plt.style.use(hep.style.ATLAS)
+# Use ATLAS/mplhep style for plotting
+plt.style.use(hep.style.ATLAS)
 
-    # Base query against PHYSLITE: per-event list of jet pT in GeV
-    base_query = FuncADLQueryPHYSLITE()
-    query = (
-        base_query
-        .Select(lambda e: {
-            "jet_pt": e.Jets().Select(lambda j: j.pt() / 1000.0),  # GeV
-        })
-    )
+# Dataset DIDs requested by the user (Rucio)
+ds_jz2 = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+ds_jz3 = "mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
 
-    # Rucio DIDs (copied exactly as requested)
-    ds_jz2 = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
-    ds_jz3 = "mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+# Build a query on PHYSLITE:
+# - Filter jets at ServiceX level: pt > 100 GeV (to reduce data volume)
+# - Return per-event list of jet pT (in GeV)
+base = FuncADLQueryPHYSLITE()
+query = (
+    base
+    .Select(lambda e: e.Jets().Where(lambda j: j.pt() / 1000.0 > 100.0))
+    .Select(lambda jets: {
+        "jet_pt": jets.Select(lambda j: j.pt() / 1000.0),
+    })
+)
 
-    # Deliver data for both datasets in a single call (NFiles=1 as per guidance)
-    results = to_awk(
-        deliver(
-            ServiceXSpec(
-                Sample=[
-                    Sample(
-                        Name="JZ2",
-                        Dataset=dataset.Rucio(ds_jz2),
-                        NFiles=1,
-                        Query=query,
-                    ),
-                    Sample(
-                        Name="JZ3",
-                        Dataset=dataset.Rucio(ds_jz3),
-                        NFiles=1,
-                        Query=query,
-                    ),
-                ]
-            ),
-        )
-    )
+# Deliver both datasets in a single ServiceX request (NFiles=1 for each)
+samples = [
+    Sample(Name="JZ2", Dataset=dataset.Rucio(ds_jz2), NFiles=1, Query=query),
+    Sample(Name="JZ3", Dataset=dataset.Rucio(ds_jz3), NFiles=1, Query=query),
+]
+result = to_awk(
+    deliver(ServiceXSpec(Sample=samples))
+)
 
-    # Extract jet pT lists (Awkward) per event
-    jets_pt_jz2 = results["JZ2"].jet_pt
-    jets_pt_jz3 = results["JZ3"].jet_pt
+# Helper: compute leading jet pT per event with Awkward only
+def leading_jet_pt_per_event(jet_pt_per_event: ak.Array) -> ak.Array:
+    # Keep only events with at least one jet
+    mask = ak.num(jet_pt_per_event, axis=1) > 0
+    jets_non_empty = jet_pt_per_event[mask]
+    # Argmax per event (keepdims for proper jagged indexing), then flatten to 1D
+    idx = ak.argmax(jets_non_empty, axis=1, keepdims=True)
+    leading = ak.flatten(jets_non_empty[idx], axis=1)
+    # Keep within requested plotting range [100, 200] GeV
+    leading = leading[(leading >= 100.0) & (leading <= 200.0)]
+    return leading
 
-    # Compute leading jet pT per event using argmax pattern (handles empty events -> None)
-    idx_jz2 = ak.argmax(jets_pt_jz2, axis=1, keepdims=True)
-    lead_pt_jz2 = ak.firsts(jets_pt_jz2[idx_jz2])
+# Extract arrays from ServiceX output and compute leading pT
+jz2_jets = result["JZ2"]["jet_pt"]
+jz3_jets = result["JZ3"]["jet_pt"]
 
-    idx_jz3 = ak.argmax(jets_pt_jz3, axis=1, keepdims=True)
-    lead_pt_jz3 = ak.firsts(jets_pt_jz3[idx_jz3])
+leading_jz2 = leading_jet_pt_per_event(jz2_jets)
+leading_jz3 = leading_jet_pt_per_event(jz3_jets)
 
-    # Remove events with no jets (None) and keep 100–200 GeV window
-    valid_jz2 = ~ak.is_none(lead_pt_jz2, axis=0)
-    valid_jz3 = ~ak.is_none(lead_pt_jz3, axis=0)
+# Build a histogram with a dataset category axis and pt axis [100, 200] GeV
+h = (
+    Hist.new
+    .Reg(50, 100.0, 200.0, name="pt", label="Leading jet $p_{T}$ [GeV]")
+    .StrCat(["JZ2", "JZ3"], name="dataset", label="Dataset")
+    .Int64()
+)
 
-    lead_pt_jz2 = lead_pt_jz2[valid_jz2]
-    lead_pt_jz3 = lead_pt_jz3[valid_jz3]
+# Fill histogram; convert to NumPy for Hist.fill
+pt_jz2 = ak.to_numpy(leading_jz2)
+pt_jz3 = ak.to_numpy(leading_jz3)
 
-    in_window_jz2 = (lead_pt_jz2 >= 100.0) & (lead_pt_jz2 <= 200.0)
-    in_window_jz3 = (lead_pt_jz3 >= 100.0) & (lead_pt_jz3 <= 200.0)
+h.fill(pt=pt_jz2, dataset=np.full(pt_jz2.shape, "JZ2", dtype=object))
+h.fill(pt=pt_jz3, dataset=np.full(pt_jz3.shape, "JZ3", dtype=object))
 
-    lead_pt_jz2_win = lead_pt_jz2[in_window_jz2]
-    lead_pt_jz3_win = lead_pt_jz3[in_window_jz3]
+# Plot stacked histogram
+fig, ax = plt.subplots()
+h.stack("dataset").plot(ax=ax, stack=True, histtype="fill", linewidth=1, edgecolor="gray")
+ax.set_xlim(100, 200)
+ax.set_title("Leading jet $p_{T}$")
+ax.legend(title="Dataset", frameon=False)
 
-    # Build histograms (50 bins from 100 to 200 GeV)
-    from hist import Hist
-
-    h_jz2 = Hist.new.Reg(50, 100.0, 200.0, name="pt", label="Leading jet $p_{T}$ [GeV]").Int64()
-    h_jz3 = Hist.new.Reg(50, 100.0, 200.0, name="pt", label="Leading jet $p_{T}$ [GeV]").Int64()
-
-    # Fill histograms (convert to NumPy for filling; still no Python lists)
-    h_jz2.fill(pt=ak.to_numpy(lead_pt_jz2_win))
-    h_jz3.fill(pt=ak.to_numpy(lead_pt_jz3_win))
-
-    # Plot overlaid comparison
-    fig, ax = plt.subplots()
-    h_jz2.plot(histtype="fill", alpha=0.5, label="JZ2")
-    h_jz3.plot(histtype="fill", alpha=0.5, label="JZ3")
-    ax.set_xlim(100.0, 200.0)
-    ax.set_xlabel("Leading jet $p_{T}$ [GeV]")
-    ax.set_ylabel("Events")
-    ax.legend()
-    ax.set_title("Leading jet $p_{T}$ (100–200 GeV)")
-
-    fig.savefig("leading_jet_pt_JZ2_vs_JZ3.png")
-    plt.close(fig)
-
-if __name__ == "__main__":
-    main()
+# Save to PNG
+fig.savefig("leading_jet_pt_stacked_100_200.png")
+plt.close(fig)
 ```
 ### stdout:
 
 ```text
 JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:20
       Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
-JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:20
-      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
+JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
+      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:30
 **Success**
 
 ```
@@ -139,39 +124,37 @@ ce8f13a8c0b6: Pulling fs layer
 8f2cf14ad14d: Pulling fs layer
 660b8664e6e1: Pulling fs layer
 eb522b4f7276: Pulling fs layer
-8fdd7df8e834: Waiting
 4f4fb700ef54: Waiting
 ce8f13a8c0b6: Waiting
-eb522b4f7276: Waiting
 8f2cf14ad14d: Waiting
 660b8664e6e1: Waiting
-235451d01566: Waiting
+eb522b4f7276: Waiting
+8fdd7df8e834: Waiting
 2a1478e0415a: Waiting
+a0831920243c: Waiting
+235451d01566: Waiting
 0f40319da806: Verifying Checksum
 0f40319da806: Download complete
-8fdd7df8e834: Verifying Checksum
+081f96d6584f: Verifying Checksum
+081f96d6584f: Download complete
 8fdd7df8e834: Download complete
 2a1478e0415a: Verifying Checksum
 2a1478e0415a: Download complete
-081f96d6584f: Verifying Checksum
-081f96d6584f: Download complete
-59e22667830b: Verifying Checksum
-59e22667830b: Download complete
 a0831920243c: Verifying Checksum
 a0831920243c: Download complete
+59e22667830b: Verifying Checksum
+59e22667830b: Download complete
+4f4fb700ef54: Download complete
 ce8f13a8c0b6: Verifying Checksum
 ce8f13a8c0b6: Download complete
-4f4fb700ef54: Verifying Checksum
-4f4fb700ef54: Download complete
-660b8664e6e1: Verifying Checksum
 660b8664e6e1: Download complete
 eb522b4f7276: Verifying Checksum
 eb522b4f7276: Download complete
 235451d01566: Verifying Checksum
 235451d01566: Download complete
+59e22667830b: Pull complete
 8f2cf14ad14d: Verifying Checksum
 8f2cf14ad14d: Download complete
-59e22667830b: Pull complete
 0f40319da806: Pull complete
 081f96d6584f: Pull complete
 8fdd7df8e834: Pull complete
@@ -196,7 +179,7 @@ bash: no job control in this shell
 </div></details>
 
 
-![44e91a77_gpt-5_leading_jet_pt_JZ2_vs_JZ3.png](img/44e91a77_gpt-5_leading_jet_pt_JZ2_vs_JZ3.png)
+![e1255027_gpt-5_leading_jet_pt_stacked_100_200.png](img/e1255027_gpt-5_leading_jet_pt_stacked_100_200.png)
 <details><summary>Usage</summary>
 <div style="margin-left: 1em;">
 
@@ -204,14 +187,14 @@ bash: no job control in this shell
 ### LLM Usage
 | Step | Time (sec) | Prompt Tokens | Completion Tokens | Total Tokens | Cost (USD) |
 |---|---|---|---|---|---|
-| Run 1 | 108.61 | 13919 | 4691 | 18610 | $0.06 |
-| **Total** | 108.61 | 13919 | 4691 | 18610 | $0.064 |
+| Run 1 | 110.08 | 13922 | 5525 | 19447 | $0.07 |
+| **Total** | 110.08 | 13922 | 5525 | 19447 | $0.073 |
 
 ### Docker Usage
 | Phase | Elapsed Time (seconds) |
 |-------|--------------|
-| Run 1 | 44.44 |
-| **Total** | **44.44** |
+| Run 1 | 48.43 |
+| **Total** | **48.43** |
 
 </div></details>
 
@@ -219,8 +202,8 @@ bash: no job control in this shell
 ## CSV
 
 Model,Time,PromptTokens,CompletionTokens,TotalTokens,EstimatedCost,Attempts,CodeTime,Result
-gpt-5,108.61,13919,4691,18610,0.064,1,44.44,Success
+gpt-5,110.08,13922,5525,19447,0.073,1,48.43,Success
 ## Summary
 | Model | Time | Prompt Tokens | Completion Tokens | Total Tokens | Estimated Cost | Attempts | Code Time | Result |
 |-----|----|-------------|-----------------|------------|--------------|--------|---------|------|
-| gpt-5 | 108.61 | 13919 | 4691 | 18610 | $0.064 | 1 | 44.44 | Success |
+| gpt-5 | 110.08 | 13922 | 5525 | 19447 | $0.073 | 1 | 48.43 | Success |
