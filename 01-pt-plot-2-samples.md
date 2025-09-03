@@ -6,42 +6,54 @@
 <div style="margin-left: 1em;">
 
 
-- Uses ServiceX (single deliver call) to read both Rucio datasets and only return per-event jet pT values (in GeV) with a ServiceX-side jet pT > 50 GeV filter to reduce data volume.
-- Computes the leading (highest pT) jet per event using Awkward (argmax trick with keepdims=True), then selects events where 100 GeV ≤ pT ≤ 200 GeV.
-- Builds two Hist histograms (one per dataset) and makes a stacked plot using mplhep; saves to PNG.
-- Only 1 file per dataset is processed (NFiles=1) for speed; expand locally later if desired.
-- No cross-section scaling is applied; MC event weights are not applied here (not fetched). If you want nominal MC weights, we can extend the query to include EventInfo weights and apply them.
+- Uses ServiceX (FuncADL on PHYSLITE) to skim only events that contain at least one jet with pT ≥ 100 GeV, and only transfers jet pT’s (in GeV) and the MC event weight to minimize data movement.
+- Computes the leading-jet pT per event with Awkward (sort per event, take first), then selects 100–200 GeV.
+- Applies only the MC event weight (no cross-section scaling); cross-section info for these JZ samples is not provided here, so the two MC samples are stacked using MC weights only.
+- Produces a stacked histogram (JZ2 + JZ3) with 50 bins over [100, 200] GeV and saves to leading_jet_pt_stacked.png.
+- Runs one ServiceX delivery with two Rucio datasets and NFiles=1 for each sample (as requested in the guidelines). You can increase NFiles when you’re ready.
 
 ```python
 import awkward as ak
+import vector
+vector.register_awkward()
+
+from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
+from servicex_analysis_utils import to_awk
+from servicex import deliver, ServiceXSpec, Sample, dataset
+
+from hist import Hist
 import matplotlib.pyplot as plt
 import mplhep as hep
-from hist import Hist
-from servicex import deliver, ServiceXSpec, Sample, dataset
-from servicex_analysis_utils import to_awk
-from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
 
-# Use ATLAS-like plotting style
-plt.style.use(hep.style.ATLAS)
-
-# Rucio dataset names (copied exactly as provided)
+# --------------------------------------------
+# Define datasets (Rucio DIDs) exactly as requested
+# --------------------------------------------
 ds_jz2 = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
 ds_jz3 = "mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
 
-# Build a ServiceX query:
-# - For each event, return a list of jet pt values (in GeV).
-# - Apply a ServiceX-side filter to keep only jets with pt > 50 GeV to reduce data volume.
+# --------------------------------------------
+# Build one query for both datasets:
+#  - Keep only events with >=1 jet with pt >= 100 GeV
+#  - Return the jets' pt (>=100 GeV only) in GeV
+#  - Return the MC event weight (mcEventWeight(0))
+# --------------------------------------------
 base = FuncADLQueryPHYSLITE()
+
 query = (
     base
-    .Select(lambda e: e.Jets().Where(lambda j: j.pt()/1000.0 > 50.0))
-    .Select(lambda jets: {
-        "jet_pt": jets.Select(lambda j: j.pt()/1000.0),  # GeV
+    .Where(lambda e: e.Jets().Where(lambda j: j.pt() / 1000.0 >= 100.0).Count() > 0)
+    .Select(lambda e: {
+        "jet_pt": e.Jets()
+                   .Where(lambda j: j.pt() / 1000.0 >= 100.0)
+                   .Select(lambda j: j.pt() / 1000.0),
+        "mcw": e.EventInfo("EventInfo").First().mcEventWeight(0),
     })
 )
 
-# Deliver from ServiceX for both datasets at once (NFiles=1 for speed)
-sx_out = to_awk(
+# --------------------------------------------
+# Deliver both datasets in a single call (NFiles=1 per guidelines)
+# --------------------------------------------
+result = to_awk(
     deliver(
         ServiceXSpec(
             Sample=[
@@ -62,83 +74,62 @@ sx_out = to_awk(
     )
 )
 
-# Access the awkward arrays per sample
-arr_jz2 = sx_out["JZ2"]
-arr_jz3 = sx_out["JZ3"]
+data_jz2 = result["JZ2"]
+data_jz3 = result["JZ3"]
 
-# Helper: compute leading jet pt per event from a jagged list of jet pts
-def leading_pt_per_event(jet_pt_nested):
-    # argmax per event (axis=1); keepdims=True so we can slice safely
-    idx = ak.argmax(jet_pt_nested, axis=1, keepdims=True)
-    # Slice to get leading pt; will yield None for events with no jets
-    leading = jet_pt_nested[idx]
-    # Remove the extra nesting introduced by keepdims=True
-    leading = ak.flatten(leading, axis=1)
-    # Drop None (events with no surviving jets)
-    leading = leading[~ak.is_none(leading)]
-    return leading
+# --------------------------------------------
+# Compute leading-jet pT per event using Awkward
+# --------------------------------------------
+# Sort jet pts in each event descending and take the first (leading)
+lead_pt_jz2 = ak.firsts(ak.sort(data_jz2["jet_pt"], axis=1, ascending=False))
+lead_pt_jz3 = ak.firsts(ak.sort(data_jz3["jet_pt"], axis=1, ascending=False))
 
-lead_jz2 = leading_pt_per_event(arr_jz2["jet_pt"])
-lead_jz3 = leading_pt_per_event(arr_jz3["jet_pt"])
+# MC event weights
+w_jz2 = data_jz2["mcw"]
+w_jz3 = data_jz3["mcw"]
 
-# Keep only leading jet pT in [100, 200] GeV
-def in_range(x, lo=100.0, hi=200.0):
-    return x[(x >= lo) & (x <= hi)]
+# Restrict to 100–200 GeV
+mask_jz2 = (lead_pt_jz2 >= 100.0) & (lead_pt_jz2 <= 200.0)
+mask_jz3 = (lead_pt_jz3 >= 100.0) & (lead_pt_jz3 <= 200.0)
 
-lead_jz2_sel = in_range(lead_jz2, 100.0, 200.0)
-lead_jz3_sel = in_range(lead_jz3, 100.0, 200.0)
+lead_pt_jz2_sel = lead_pt_jz2[mask_jz2]
+w_jz2_sel = w_jz2[mask_jz2]
 
-# Build histograms (50 bins between 100 and 200 GeV)
-h_jz2 = (
+lead_pt_jz3_sel = lead_pt_jz3[mask_jz3]
+w_jz3_sel = w_jz3[mask_jz3]
+
+# --------------------------------------------
+# Build a stacked histogram over [100, 200] GeV with 50 bins
+# --------------------------------------------
+h = (
     Hist.new
-    .Reg(50, 100.0, 200.0, name="jet_pt", label="Leading jet $p_{T}$ [GeV]")
-    .Weight()
-)
-h_jz3 = (
-    Hist.new
-    .Reg(50, 100.0, 200.0, name="jet_pt", label="Leading jet $p_{T}$ [GeV]")
+    .Reg(50, 100.0, 200.0, name="pt", label="Leading jet $p_T$ [GeV]")
+    .StrCat([], name="sample", label="Sample", growth=True)
     .Weight()
 )
 
-# No event-weighting applied here (weight=1.0). If you want MC nominal weights,
-# extend the query to fetch EventInfo weights and pass them here.
-h_jz2.fill(jet_pt=lead_jz2_sel, weight=1.0)
-h_jz3.fill(jet_pt=lead_jz3_sel, weight=1.0)
+# Fill per sample (Awkward -> NumPy for Hist fill)
+h.fill(pt=ak.to_numpy(lead_pt_jz2_sel), sample="JZ2", weight=ak.to_numpy(w_jz2_sel))
+h.fill(pt=ak.to_numpy(lead_pt_jz3_sel), sample="JZ3", weight=ak.to_numpy(w_jz3_sel))
 
-# Make a stacked plot
+# --------------------------------------------
+# Plot and save
+# --------------------------------------------
+plt.style.use(hep.style.ATLAS)
 fig, ax = plt.subplots()
-
-# mplhep can stack multiple Hist objects
-hep.histplot(
-    [h_jz2, h_jz3],
-    ax=ax,
-    histtype="fill",
-    stack=True,
-    label=["JZ2", "JZ3"],
-    edgecolor="black",
-    linewidth=0.8,
-)
-
-ax.set_xlabel("Leading jet $p_{T}$ [GeV]")
-ax.set_ylabel("Events")
-ax.set_title("Leading jet $p_{T}$ (100–200 GeV)")
-ax.legend()
-
-fig.tight_layout()
-fig.savefig("leading_jet_pt_100_200_stacked.png")
+h.plot(histtype="fill", stack=True, ax=ax)
+ax.set_title("Leading jet $p_T$")
+ax.legend(title="Sample")
+fig.savefig("leading_jet_pt_stacked.png")
 plt.close(fig)
-
-print("Wrote: leading_jet_pt_100_200_stacked.png")
 ```
 ### stdout:
 
 ```text
-JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
-      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:30
-JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:20
-      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
-Wrote: leading_jet_pt_100_200_stacked.png
-**Success**
+JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0/?  
+      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0/?  
+JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0/?  
+      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0/?  
 
 ```
 
@@ -163,33 +154,31 @@ eb522b4f7276: Pulling fs layer
 ce8f13a8c0b6: Waiting
 8f2cf14ad14d: Waiting
 660b8664e6e1: Waiting
-8fdd7df8e834: Waiting
-2a1478e0415a: Waiting
 eb522b4f7276: Waiting
-a0831920243c: Waiting
+2a1478e0415a: Waiting
 235451d01566: Waiting
+a0831920243c: Waiting
 0f40319da806: Verifying Checksum
 0f40319da806: Download complete
 081f96d6584f: Verifying Checksum
 081f96d6584f: Download complete
 8fdd7df8e834: Verifying Checksum
 8fdd7df8e834: Download complete
+2a1478e0415a: Download complete
 59e22667830b: Verifying Checksum
 59e22667830b: Download complete
 a0831920243c: Verifying Checksum
 a0831920243c: Download complete
 4f4fb700ef54: Verifying Checksum
 4f4fb700ef54: Download complete
-2a1478e0415a: Verifying Checksum
-2a1478e0415a: Download complete
 ce8f13a8c0b6: Verifying Checksum
 ce8f13a8c0b6: Download complete
 235451d01566: Verifying Checksum
 235451d01566: Download complete
+660b8664e6e1: Verifying Checksum
 eb522b4f7276: Verifying Checksum
 eb522b4f7276: Download complete
-660b8664e6e1: Verifying Checksum
-660b8664e6e1: Download complete
+8f2cf14ad14d: Verifying Checksum
 8f2cf14ad14d: Download complete
 59e22667830b: Pull complete
 0f40319da806: Pull complete
@@ -209,6 +198,328 @@ bash: cannot set terminal process group (-1): Inappropriate ioctl for device
 bash: no job control in this shell
 /work/.venv/lib/python3.13/site-packages/func_adl_servicex_xaodr25/trigger.py:127: SyntaxWarning: invalid escape sequence '\D'
   object. Close match is done as a function of $\Delta R < `dr`$.
+Method First not found on object <class 'func_adl_servicex_xaodr25.xAOD.eventinfo_v1.EventInfo_v1'>
+Traceback (most recent call last):
+  File "/app/script.py", line 41, in <module>
+    result = to_awk(
+        deliver(
+    ...<16 lines>...
+        )
+    )
+  File "/work/.venv/lib/python3.13/site-packages/servicex_analysis_utils/materialization.py", line 56, in to_awk
+    if not paths:
+           ^^^^^
+  File "/work/.venv/lib/python3.13/site-packages/servicex/servicex_client.py", line 110, in __len__
+    raise data
+servicex.servicex_client.ReturnValueException: Exception occurred while making ServiceX request.
+Traceback (most recent call last):
+  File "/work/.venv/lib/python3.13/site-packages/servicex/query_core.py", line 655, in as_files_async
+    return await self.submit_and_download(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        signed_urls_only=False, expandable_progress=progress
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/work/.venv/lib/python3.13/site-packages/servicex/query_core.py", line 327, in submit_and_download
+    self.request_id = await self.servicex.submit_transform(sx_request)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/.venv/lib/python3.13/site-packages/servicex/servicex_adapter.py", line 372, in submit_transform
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: ServiceX WebAPI Error during transformation submission: 500 - Something went wrong (Failed to generate translation code: Unable to generate a sequence from the given AST. Either there is an internal error, or you are trying to manipulate a const xAOD::EventInfo_v1 * value (expression eventinfo5609) ('cpp_variable') as a sequence (ast is: ('EventInfo')))
+
+
+```
+
+
+</div></details>
+<details><summary>Run 2</summary>
+<div style="margin-left: 1em;">
+
+
+- Root cause: EventInfo is a single object, not a sequence. Calling .First() on it caused:
+  - “Method First not found on object … EventInfo_v1”
+  - Translator failure: “trying to manipulate a const xAOD::EventInfo_v1* value as a sequence”
+- Fix: Remove .First() when accessing the MC event weight. Use e.EventInfo("EventInfo").mcEventWeight(0) directly.
+- Everything else (single deliver call, NFiles=1, Awkward-only manipulation, histogram to PNG) remains as before.
+
+```python
+import awkward as ak
+import vector
+vector.register_awkward()
+
+from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
+from servicex_analysis_utils import to_awk
+from servicex import deliver, ServiceXSpec, Sample, dataset
+
+from hist import Hist
+import matplotlib.pyplot as plt
+import mplhep as hep
+
+# --------------------------------------------
+# Define datasets (Rucio DIDs) exactly as requested
+# --------------------------------------------
+ds_jz2 = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+ds_jz3 = "mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+
+# --------------------------------------------
+# Build one query for both datasets:
+#  - Keep only events with >=1 jet with pt >= 100 GeV
+#  - Return the jets' pt (>=100 GeV only) in GeV
+#  - Return the MC event weight (mcEventWeight(0))
+# --------------------------------------------
+base = FuncADLQueryPHYSLITE()
+
+query = (
+    base
+    .Where(lambda e: e.Jets().Where(lambda j: j.pt() / 1000.0 >= 100.0).Count() > 0)
+    .Select(lambda e: {
+        "jet_pt": e.Jets()
+                   .Where(lambda j: j.pt() / 1000.0 >= 100.0)
+                   .Select(lambda j: j.pt() / 1000.0),
+        # EventInfo is a single object; do not call .First() on it
+        "mcw": e.EventInfo("EventInfo").mcEventWeight(0),
+    })
+)
+
+# --------------------------------------------
+# Deliver both datasets in a single call (NFiles=1 per guidelines)
+# --------------------------------------------
+result = to_awk(
+    deliver(
+        ServiceXSpec(
+            Sample=[
+                Sample(
+                    Name="JZ2",
+                    Dataset=dataset.Rucio(ds_jz2),
+                    NFiles=1,
+                    Query=query,
+                ),
+                Sample(
+                    Name="JZ3",
+                    Dataset=dataset.Rucio(ds_jz3),
+                    NFiles=1,
+                    Query=query,
+                ),
+            ]
+        )
+    )
+)
+
+data_jz2 = result["JZ2"]
+data_jz3 = result["JZ3"]
+
+# --------------------------------------------
+# Compute leading-jet pT per event using Awkward
+# --------------------------------------------
+lead_pt_jz2 = ak.firsts(ak.sort(data_jz2["jet_pt"], axis=1, ascending=False))
+lead_pt_jz3 = ak.firsts(ak.sort(data_jz3["jet_pt"], axis=1, ascending=False))
+
+# MC event weights
+w_jz2 = data_jz2["mcw"]
+w_jz3 = data_jz3["mcw"]
+
+# Restrict to 100–200 GeV
+mask_jz2 = (lead_pt_jz2 >= 100.0) & (lead_pt_jz2 <= 200.0)
+mask_jz3 = (lead_pt_jz3 >= 100.0) & (lead_pt_jz3 <= 200.0)
+
+lead_pt_jz2_sel = lead_pt_jz2[mask_jz2]
+w_jz2_sel = w_jz2[mask_jz2]
+
+lead_pt_jz3_sel = lead_pt_jz3[mask_jz3]
+w_jz3_sel = w_jz3[mask_jz3]
+
+# --------------------------------------------
+# Build a stacked histogram over [100, 200] GeV with 50 bins
+# --------------------------------------------
+h = (
+    Hist.new
+    .Reg(50, 100.0, 200.0, name="pt", label="Leading jet $p_T$ [GeV]")
+    .StrCat([], name="sample", label="Sample", growth=True)
+    .Weight()
+)
+
+# Fill per sample (Awkward -> NumPy for Hist fill)
+h.fill(pt=ak.to_numpy(lead_pt_jz2_sel), sample="JZ2", weight=ak.to_numpy(w_jz2_sel))
+h.fill(pt=ak.to_numpy(lead_pt_jz3_sel), sample="JZ3", weight=ak.to_numpy(w_jz3_sel))
+
+# --------------------------------------------
+# Plot and save
+# --------------------------------------------
+plt.style.use(hep.style.ATLAS)
+fig, ax = plt.subplots()
+h.plot(histtype="fill", stack=True, ax=ax)
+ax.set_title("Leading jet $p_T$")
+ax.legend(title="Sample")
+fig.savefig("leading_jet_pt_stacked.png")
+plt.close(fig)
+```
+### stdout:
+
+```text
+JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
+      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:30
+JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:41
+      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:45
+
+```
+
+### stderr:
+
+```text
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+/work/.venv/lib/python3.13/site-packages/func_adl_servicex_xaodr25/trigger.py:127: SyntaxWarning: invalid escape sequence '\D'
+  object. Close match is done as a function of $\Delta R < `dr`$.
+/work/.venv/lib/python3.13/site-packages/hist/quick_construct.py:381: UserWarning: sample is a protected keyword and cannot be used as axis name
+  return self.hist_class(
+Traceback (most recent call last):
+  File "/app/script.py", line 97, in <module>
+    h.fill(pt=ak.to_numpy(lead_pt_jz2_sel), sample="JZ2", weight=ak.to_numpy(w_jz2_sel))
+    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/.venv/lib/python3.13/site-packages/hist/basehist.py", line 259, in fill
+    raise TypeError(
+        "All axes must be accounted for in fill, you may have used a disallowed name in the axes"
+    )
+TypeError: All axes must be accounted for in fill, you may have used a disallowed name in the axes
+
+```
+
+
+</div></details>
+<details><summary>Run 3</summary>
+<div style="margin-left: 1em;">
+
+
+- The Hist error comes from using "sample" as an axis name. In Hist, "sample" is a protected keyword and cannot be used as an axis name, which triggers the warning. Because the axis name was rejected, the subsequent fill call could not match all axes ("All axes must be accounted for in fill"), causing the TypeError.
+- Fix: rename the categorical axis from "sample" to a non-reserved name (e.g., "ds"), and update the fill calls to use ds="JZ2"/"JZ3". Everything else remains the same. The ServiceX query and Awkward manipulations are fine.
+
+```python
+import awkward as ak
+import vector
+vector.register_awkward()
+
+from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
+from servicex_analysis_utils import to_awk
+from servicex import deliver, ServiceXSpec, Sample, dataset
+
+from hist import Hist
+import matplotlib.pyplot as plt
+import mplhep as hep
+
+# --------------------------------------------
+# Define datasets (Rucio DIDs) exactly as requested
+# --------------------------------------------
+ds_jz2 = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+ds_jz3 = "mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+
+# --------------------------------------------
+# Build one query for both datasets:
+#  - Keep only events with >=1 jet with pt >= 100 GeV
+#  - Return the jets' pt (>=100 GeV only) in GeV
+#  - Return the MC event weight (mcEventWeight(0))
+# --------------------------------------------
+base = FuncADLQueryPHYSLITE()
+
+query = (
+    base
+    .Where(lambda e: e.Jets().Where(lambda j: j.pt() / 1000.0 >= 100.0).Count() > 0)
+    .Select(lambda e: {
+        "jet_pt": e.Jets()
+                   .Where(lambda j: j.pt() / 1000.0 >= 100.0)
+                   .Select(lambda j: j.pt() / 1000.0),
+        "mcw": e.EventInfo("EventInfo").mcEventWeight(0),
+    })
+)
+
+# --------------------------------------------
+# Deliver both datasets in a single call (NFiles=1 per guidelines)
+# --------------------------------------------
+result = to_awk(
+    deliver(
+        ServiceXSpec(
+            Sample=[
+                Sample(
+                    Name="JZ2",
+                    Dataset=dataset.Rucio(ds_jz2),
+                    NFiles=1,
+                    Query=query,
+                ),
+                Sample(
+                    Name="JZ3",
+                    Dataset=dataset.Rucio(ds_jz3),
+                    NFiles=1,
+                    Query=query,
+                ),
+            ]
+        )
+    )
+)
+
+data_jz2 = result["JZ2"]
+data_jz3 = result["JZ3"]
+
+# --------------------------------------------
+# Compute leading-jet pT per event using Awkward
+# --------------------------------------------
+lead_pt_jz2 = ak.firsts(ak.sort(data_jz2["jet_pt"], axis=1, ascending=False))
+lead_pt_jz3 = ak.firsts(ak.sort(data_jz3["jet_pt"], axis=1, ascending=False))
+
+# MC event weights
+w_jz2 = data_jz2["mcw"]
+w_jz3 = data_jz3["mcw"]
+
+# Restrict to 100–200 GeV
+mask_jz2 = (lead_pt_jz2 >= 100.0) & (lead_pt_jz2 <= 200.0)
+mask_jz3 = (lead_pt_jz3 >= 100.0) & (lead_pt_jz3 <= 200.0)
+
+lead_pt_jz2_sel = lead_pt_jz2[mask_jz2]
+w_jz2_sel = w_jz2[mask_jz2]
+
+lead_pt_jz3_sel = lead_pt_jz3[mask_jz3]
+w_jz3_sel = w_jz3[mask_jz3]
+
+# --------------------------------------------
+# Build a stacked histogram over [100, 200] GeV with 50 bins
+# --------------------------------------------
+h = (
+    Hist.new
+    .Reg(50, 100.0, 200.0, name="pt", label="Leading jet $p_{T}$ [GeV]")
+    .StrCat([], name="ds", label="Dataset", growth=True)  # renamed axis from 'sample' -> 'ds'
+    .Weight()
+)
+
+# Fill per dataset (Awkward -> NumPy for Hist fill)
+h.fill(pt=ak.to_numpy(lead_pt_jz2_sel), ds="JZ2", weight=ak.to_numpy(w_jz2_sel))
+h.fill(pt=ak.to_numpy(lead_pt_jz3_sel), ds="JZ3", weight=ak.to_numpy(w_jz3_sel))
+
+# --------------------------------------------
+# Plot and save
+# --------------------------------------------
+plt.style.use(hep.style.ATLAS)
+fig, ax = plt.subplots()
+h.plot(histtype="fill", stack=True, ax=ax)
+ax.set_title("Leading jet $p_{T}$")
+ax.legend(title="Dataset")
+fig.savefig("leading_jet_pt_stacked.png")
+plt.close(fig)
+```
+### stdout:
+
+```text
+
+**Success**
+
+```
+
+### stderr:
+
+```text
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+/work/.venv/lib/python3.13/site-packages/func_adl_servicex_xaodr25/trigger.py:127: SyntaxWarning: invalid escape sequence '\D'
+  object. Close match is done as a function of $\Delta R < `dr`$.
 
 ```
 
@@ -216,7 +527,7 @@ bash: no job control in this shell
 </div></details>
 
 
-![e1255027_gpt-5_leading_jet_pt_100_200_stacked.png](img/e1255027_gpt-5_leading_jet_pt_100_200_stacked.png)
+![e1255027_gpt-5_leading_jet_pt_stacked.png](img/e1255027_gpt-5_leading_jet_pt_stacked.png)
 <details><summary>Usage</summary>
 <div style="margin-left: 1em;">
 
@@ -224,14 +535,18 @@ bash: no job control in this shell
 ### LLM Usage
 | Step | Time (sec) | Prompt Tokens | Completion Tokens | Total Tokens | Cost (USD) |
 |---|---|---|---|---|---|
-| Run 1 | 143.26 | 14088 | 5429 | 19517 | $0.07 |
-| **Total** | 143.26 | 14088 | 5429 | 19517 | $0.072 |
+| Run 1 | 98.71 | 14211 | 4612 | 18823 | $0.06 |
+| Run 2 | 57.75 | 16462 | 2550 | 19012 | $0.05 |
+| Run 3 | 55.89 | 15485 | 2366 | 17851 | $0.04 |
+| **Total** | 212.35 | 46158 | 9528 | 55686 | $0.153 |
 
 ### Docker Usage
 | Phase | Elapsed Time (seconds) |
 |-------|--------------|
-| Run 1 | 48.25 |
-| **Total** | **48.25** |
+| Run 1 | 17.03 |
+| Run 2 | 53.40 |
+| Run 3 | 7.12 |
+| **Total** | **77.55** |
 
 </div></details>
 
@@ -239,8 +554,8 @@ bash: no job control in this shell
 ## CSV
 
 Model,Time,PromptTokens,CompletionTokens,TotalTokens,EstimatedCost,Attempts,CodeTime,Result
-gpt-5,143.26,14088,5429,19517,0.072,1,48.25,Success
+gpt-5,212.35,46158,9528,55686,0.153,3,77.55,Success
 ## Summary
 | Model | Time | Prompt Tokens | Completion Tokens | Total Tokens | Estimated Cost | Attempts | Code Time | Result |
 |-----|----|-------------|-----------------|------------|--------------|--------|---------|------|
-| gpt-5 | 143.26 | 14088 | 5429 | 19517 | $0.072 | 1 | 48.25 | Success |
+| gpt-5 | 212.35 | 46158 | 9528 | 55686 | $0.153 | 3 | 77.55 | Success |
