@@ -6,138 +6,149 @@
 <div style="margin-left: 1em;">
 
 
-- Fetches both rucio datasets with a single ServiceX request (NFiles=1 for each) and brings back only what’s needed: per-event jet pT (in GeV), the MC event weight, and a per-event counter for event counting.
-- Uses Awkward Array to find the leading-jet pT per event via ak.argmax, selects events where the leading-jet pT is in [100, 200] GeV, and applies weights.
-- Applies MC event weights and cross-section scaling to 1 fb^-1 luminosity:
-  - JZ2 (run 801167): 2.58 milli-barn
-  - JZ3 (run 801168): 8.6 micro-barn
-- Builds a weighted histogram with a categorical “process” axis and produces a stacked plot saved to leading_jet_pt_100_200_stacked.png.
-- Note: Only one file per dataset (NFiles=1) is processed here; increase NFiles yourself when you’re ready to run more.
+- Uses ServiceX (func_adl, PHYSLITE) to fetch only what’s needed from the two requested GRID datasets, filtering jets at the ServiceX level to 100 < pT < 200 GeV to minimize data transfer.
+- Computes, per event, the leading-jet pT (if any jet is in the 100–200 GeV window) with Awkward only, no Python loops.
+- Applies MC event weights and scales each MC sample to an integrated luminosity of 1 fb^-1 using cross sections:
+  - 801167 (JZ2): 2,582,600,000.0 pb
+  - 801168 (JZ3): 28,528,000.0 pb
+  The scale factor per sample is sf = (L_pb × sigma_pb) / N_total, with L_pb = 1000 × L_fb and N_total counted before any cuts (i.e., all events).
+- Builds a weighted, stacked histogram (100–200 GeV, 50 bins) of the leading jet pT and saves the plot to leading_jet_pt_stacked.png.
+- Notes:
+  - NFiles=1 is used for each dataset; when you are ready you can increase this locally.
+  - You can adjust the luminosity by changing lumifb in the code.
 
 ```python
 import awkward as ak
 import numpy as np
-import vector
-vector.register_awkward()
+from hist import Hist
+import matplotlib.pyplot as plt
+import mplhep as hep
 
 from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
 from servicex_analysis_utils import to_awk
 from servicex import deliver, ServiceXSpec, Sample, dataset
 
-from hist import Hist
-import matplotlib.pyplot as plt
-import mplhep as hep
-
+# Style for plotting
 plt.style.use(hep.style.ATLAS)
 
-# Dataset names (Rucio DIDs) – copied exactly as requested
+# Datasets (as requested)
 ds_jz2 = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
 ds_jz3 = "mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
 
-# Base query for PHYSLITE
-base_query = FuncADLQueryPHYSLITE()
+# Cross sections (pb), from provided table
+xsec_pb = {
+    "JZ2": 2582600000.0,  # 801167
+    "JZ3": 28528000.0,    # 801168
+}
 
-# Query: per-event jets' pT (GeV), MC event weight, and an event counter
+# Target integrated luminosity (fb^-1)
+lumifb = 1.0  # change if desired
+L_pb = lumifb * 1000.0  # convert fb^-1 to pb^-1
+
+# Build a single query to fetch:
+# - per-event MC weight
+# - a per-event constant "one" to count total events before cuts
+# - per-event jets with pT in (100, 200) GeV (to reduce data moved)
+base_query = FuncADLQueryPHYSLITE()
 query = (
     base_query
-    .Select(lambda e: {
-        "jet_pt": e.Jets().Select(lambda j: j.pt() / 1000.0),  # GeV
-        "mcw": e.EventInfo("EventInfo").mcEventWeight(0),
-        "one": 1.0,
-    })
+    .Select(
+        lambda e: {
+            "evt_weight": e.EventInfo("EventInfo").mcEventWeight(0),
+            "one": 1.0,
+            "jet_pt": e.Jets()
+                       .Where(lambda j: (j.pt() / 1000.0 > 100.0) and (j.pt() / 1000.0 < 200.0))
+                       .Select(lambda j: j.pt() / 1000.0),
+        }
+    )
 )
 
-# ServiceX delivery: both datasets in a single request; keep NFiles=1
-spec = ServiceXSpec(
-    Sample=[
-        Sample(
-            Name="JZ2",
-            Dataset=dataset.Rucio(ds_jz2),
-            NFiles=1,  # Keep to 1; scale yourself when ready
-            Query=query,
-        ),
-        Sample(
-            Name="JZ3",
-            Dataset=dataset.Rucio(ds_jz3),
-            NFiles=1,  # Keep to 1; scale yourself when ready
-            Query=query,
-        ),
-    ]
+# Deliver both datasets in one call
+all_data = to_awk(
+    deliver(
+        ServiceXSpec(
+            Sample=[
+                Sample(
+                    Name="JZ2",
+                    Dataset=dataset.Rucio(ds_jz2),
+                    NFiles=1,
+                    Query=query,
+                ),
+                Sample(
+                    Name="JZ3",
+                    Dataset=dataset.Rucio(ds_jz3),
+                    NFiles=1,
+                    Query=query,
+                ),
+            ]
+        )
+    )
 )
 
-all_data = to_awk(deliver(spec))
-d_jz2 = all_data["JZ2"]
-d_jz3 = all_data["JZ3"]
+data_jz2 = all_data["JZ2"]
+data_jz3 = all_data["JZ3"]
 
-# Helper to compute leading-jet pT per event and weights, applying selection 100–200 GeV
-def select_leading_pt_and_weights(d, sigma_fb):
-    # Leading jet pT per event using argmax
-    # Keepdims gives [[idx]] so we can slice; then ak.firsts to get a 1D array with Nones where needed
-    lead_idx = ak.argmax(d["jet_pt"], axis=1, keepdims=True)
-    lead_pt = ak.firsts(d["jet_pt"][lead_idx])
+def leading_pt_and_weights(sample_data, sample_name):
+    # Total events BEFORE any cuts
+    n_total = len(sample_data["one"])
 
-    # Event selection: leading jet pT in [100, 200] GeV and not None
-    in_range = (~ak.is_none(lead_pt)) & (lead_pt >= 100.0) & (lead_pt <= 200.0)
+    # Compute per-sample scale factor (MC xsec scaling to the chosen luminosity)
+    sigma = xsec_pb[sample_name]
+    sf = (L_pb * sigma) / n_total
 
-    # Count all events processed in this sample (before any cuts) for scaling
-    n_events = len(d["one"])
-    # Luminosity (fb^-1)
-    L_fb = 1.0
+    # Leading jet pT (per event) within 100–200 GeV (already filtered at ServiceX)
+    # Sort each event's jet list descending and take the first
+    sorted_pts = ak.sort(sample_data["jet_pt"], axis=1, ascending=False)
+    leading_pt = ak.firsts(sorted_pts)
 
-    # Scale factor per-event for this sample: L * sigma / N_S
-    sf = (L_fb * sigma_fb) / float(n_events) if n_events > 0 else 0.0
+    # Keep only events that have a leading jet in this window (i.e., not None)
+    good = ~ak.is_none(leading_pt)
+    leading_pt = leading_pt[good]
 
-    # Total event weight = mc event weight * sf
-    w = d["mcw"] * sf
+    # Event weights: MC event weight times sample scale factor
+    evt_w = sample_data["evt_weight"][good] * sf
 
-    # Apply selection
-    sel_pt = lead_pt[in_range]
-    sel_w = w[in_range]
+    return leading_pt, evt_w
 
-    # Convert to numpy for Hist.fill
-    return ak.to_numpy(sel_pt), ak.to_numpy(sel_w)
+lp_jz2, w_jz2 = leading_pt_and_weights(data_jz2, "JZ2")
+lp_jz3, w_jz3 = leading_pt_and_weights(data_jz3, "JZ3")
 
-# Cross sections converted to femto-barn (fb)
-# 1 barn = 1e15 fb
-sigma_fb_jz2 = 2.58e-3 * 1.0e15   # 2.58 milli-barn
-sigma_fb_jz3 = 8.6e-6  * 1.0e15   # 8.6 micro-barn
-
-pt_jz2, w_jz2 = select_leading_pt_and_weights(d_jz2, sigma_fb_jz2)
-pt_jz3, w_jz3 = select_leading_pt_and_weights(d_jz3, sigma_fb_jz3)
-
-# Histogram: 50 bins between 100 and 200 GeV, with categorical process axis; weighted storage
+# Create a weighted histogram with a process category axis for stacking
 h = (
     Hist.new
-        .Reg(50, 100.0, 200.0, name="pt", label=r"Leading jet $p_{T}$ [GeV]")
-        .StrCat(["JZ2", "JZ3"], name="process", label="Process")
+        .Reg(50, 100.0, 200.0, name="jet_pt", label="Leading jet $p_{T}$ [GeV]")
+        .StrCat([], name="process", label="Process", growth=True)
         .Weight()
 )
 
-# Fill for each process
-h.fill(pt=pt_jz2, process="JZ2", weight=w_jz2)
-h.fill(pt=pt_jz3, process="JZ3", weight=w_jz3)
+# Fill histogram for each process
+h.fill(jet_pt=ak.to_numpy(lp_jz2), process="JZ2", weight=ak.to_numpy(w_jz2))
+h.fill(jet_pt=ak.to_numpy(lp_jz3), process="JZ3", weight=ak.to_numpy(w_jz3))
 
-# Make a stacked plot
+# Plot stacked
 fig, ax = plt.subplots()
-h_stack = h.stack("process")
-# Plot as stacked filled histograms
-h_stack.plot(stack=True, histtype="fill", linewidth=1, edgecolor="black")
-ax.set_xlim(100, 200)
-ax.set_xlabel(r"Leading jet $p_{T}$ [GeV]")
-ax.set_ylabel("Events (weighted)")
-ax.set_title("Leading jet $p_{T}$")
-ax.legend(title="Process")
+# Plot each slice stacked on the same axes
+h[:, "JZ2"].plot(ax=ax, histtype="fill", linewidth=1, edgecolor="gray", label="JZ2", stack=True)
+h[:, "JZ3"].plot(ax=ax, histtype="fill", linewidth=1, edgecolor="gray", label="JZ3", stack=True)
 
-fig.savefig("leading_jet_pt_100_200_stacked.png")
+ax.legend()
+ax.set_xlabel("Leading jet $p_{T}$ [GeV]")
+ax.set_ylabel("Events")
+ax.set_title("Leading jet $p_{T}$ (stacked)")
+
+fig.savefig("leading_jet_pt_stacked.png")
 plt.close(fig)
+
+print("Wrote: leading_jet_pt_stacked.png")
 ```
 ### stdout:
 
 ```text
-JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:21
+JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:20
       Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
-JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:21
-      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:26
+JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
+      Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:30
+Wrote: leading_jet_pt_stacked.png
 **Success**
 
 ```
@@ -166,33 +177,31 @@ a0831920243c: Waiting
 ce8f13a8c0b6: Waiting
 8f2cf14ad14d: Waiting
 660b8664e6e1: Waiting
-8fdd7df8e834: Waiting
 eb522b4f7276: Waiting
+8fdd7df8e834: Waiting
 0f40319da806: Verifying Checksum
 0f40319da806: Download complete
 081f96d6584f: Verifying Checksum
 081f96d6584f: Download complete
-8fdd7df8e834: Verifying Checksum
-8fdd7df8e834: Download complete
-59e22667830b: Verifying Checksum
-59e22667830b: Download complete
 2a1478e0415a: Verifying Checksum
 2a1478e0415a: Download complete
-a0831920243c: Verifying Checksum
+59e22667830b: Verifying Checksum
+59e22667830b: Download complete
 a0831920243c: Download complete
+4f4fb700ef54: Verifying Checksum
 4f4fb700ef54: Download complete
+8fdd7df8e834: Verifying Checksum
+8fdd7df8e834: Download complete
+235451d01566: Verifying Checksum
+235451d01566: Download complete
 ce8f13a8c0b6: Verifying Checksum
 ce8f13a8c0b6: Download complete
+59e22667830b: Pull complete
 660b8664e6e1: Verifying Checksum
 660b8664e6e1: Download complete
 eb522b4f7276: Verifying Checksum
 eb522b4f7276: Download complete
-59e22667830b: Pull complete
-8f2cf14ad14d: Verifying Checksum
-8f2cf14ad14d: Download complete
 0f40319da806: Pull complete
-235451d01566: Verifying Checksum
-235451d01566: Download complete
 081f96d6584f: Pull complete
 8fdd7df8e834: Pull complete
 2a1478e0415a: Pull complete
@@ -200,6 +209,8 @@ eb522b4f7276: Download complete
 a0831920243c: Pull complete
 4f4fb700ef54: Pull complete
 ce8f13a8c0b6: Pull complete
+8f2cf14ad14d: Verifying Checksum
+8f2cf14ad14d: Download complete
 8f2cf14ad14d: Pull complete
 660b8664e6e1: Pull complete
 eb522b4f7276: Pull complete
@@ -216,7 +227,7 @@ bash: no job control in this shell
 </div></details>
 
 
-![e1255027_gpt-5_leading_jet_pt_100_200_stacked.png](img/e1255027_gpt-5_leading_jet_pt_100_200_stacked.png)
+![e1255027_gpt-5_leading_jet_pt_stacked.png](img/e1255027_gpt-5_leading_jet_pt_stacked.png)
 <details><summary>Usage</summary>
 <div style="margin-left: 1em;">
 
@@ -224,14 +235,14 @@ bash: no job control in this shell
 ### LLM Usage
 | Step | Time (sec) | Prompt Tokens | Completion Tokens | Total Tokens | Cost (USD) |
 |---|---|---|---|---|---|
-| Run 1 | 105.48 | 14746 | 5698 | 20444 | $0.08 |
-| **Total** | 105.48 | 14746 | 5698 | 20444 | $0.075 |
+| Run 1 | 94.45 | 14751 | 7004 | 21755 | $0.09 |
+| **Total** | 94.45 | 14751 | 7004 | 21755 | $0.088 |
 
 ### Docker Usage
 | Phase | Elapsed Time (seconds) |
 |-------|--------------|
-| Run 1 | 47.31 |
-| **Total** | **47.31** |
+| Run 1 | 48.12 |
+| **Total** | **48.12** |
 
 </div></details>
 
@@ -239,8 +250,8 @@ bash: no job control in this shell
 ## CSV
 
 Model,Time,PromptTokens,CompletionTokens,TotalTokens,EstimatedCost,Attempts,CodeTime,Result
-gpt-5,105.48,14746,5698,20444,0.075,1,47.31,Success
+gpt-5,94.45,14751,7004,21755,0.088,1,48.12,Success
 ## Summary
 | Model | Time | Prompt Tokens | Completion Tokens | Total Tokens | Estimated Cost | Attempts | Code Time | Result |
 |-----|----|-------------|-----------------|------------|--------------|--------|---------|------|
-| gpt-5 | 105.48 | 14746 | 5698 | 20444 | $0.075 | 1 | 47.31 | Success |
+| gpt-5 | 94.45 | 14751 | 7004 | 21755 | $0.088 | 1 | 48.12 | Success |
