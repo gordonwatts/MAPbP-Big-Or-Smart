@@ -6,41 +6,47 @@
 <div style="margin-left: 1em;">
 
 
-- Fetched only the quantities needed (missing transverse energy and MC event weight) from the requested Rucio dataset using ServiceX, converting MeV to GeV inside the query.
-- Used Awkward Array to hold and manipulate the returned data (no Python lists).
-- Applied per-event MC weights (EventInfo.mcEventWeight(0)) when filling the histogram. No cross section or luminosity scaling was applied since only a single MC dataset was requested.
-- Plotted the ETmiss distribution with Hist/mplhep and saved it to a PNG file.
-- Processed only 1 file (NFiles=1) to keep turnaround fast; you can increase this when ready.
+- Fetches ETmiss and MC event weights from the requested DAOD_PHYSLITE dataset using ServiceX (NFiles=1).
+- Converts ETmiss from MeV to GeV at the ServiceX level to minimize data volume.
+- Uses Awkward Array for all data manipulation and Hist to build a weighted 1D histogram (50 bins, 0–200 GeV).
+- Applies only the MC event weight (per guidance for a single MC dataset).
+- Plots with an ATLAS-like style and saves to etmiss.png.
 
 ```python
 import awkward as ak
+import numpy as np
+import vector
+vector.register_awkward()
+
+from hist import Hist
 import matplotlib.pyplot as plt
 import mplhep as hep
-from hist import Hist
 
 from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
 from servicex_analysis_utils import to_awk
 from servicex import deliver, ServiceXSpec, Sample, dataset
 
-# Build the query against PHYSLITE:
-# - Convert MeV -> GeV in the query (divide by 1000.0)
+# Build the ServiceX/func_adl query against PHYSLITE
 base_query = FuncADLQueryPHYSLITE()
+
+# Select per-event ETmiss (in GeV) and the MC event weight
 query = (
     base_query
+    .Where(lambda e: e.MissingET().Count() > 0)
     .Select(lambda e: {
-        "met": e.MissingET().First().met() / 1000.0,
-        "mcw": e.EventInfo("EventInfo").mcEventWeight(0),
+        "met": e.MissingET().First().met() / 1000.0,  # MeV -> GeV
+        "weight": e.EventInfo("EventInfo").mcEventWeight(0),
     })
 )
 
-# Dataset DID provided by the user (copy carefully!)
+# Dataset DID (Rucio)
 ds_name = (
-    "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv."
-    "DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
+    "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE."
+    "e8514_e8528_a911_s4114_r15224_r15225_p6697"
 )
 
-# Deliver the data (use NFiles=1 for a quick turn-around)
-results = to_awk(
+# Deliver the data (NFiles=1 per guidance)
+all_data = to_awk(
     deliver(
         ServiceXSpec(
             Sample=[
@@ -51,45 +57,35 @@ results = to_awk(
                     Query=query,
                 )
             ]
-        ),
+        )
     )
 )
 
-data = results["etmiss_fetch"]
+data = all_data["etmiss_fetch"]
 
-# Awkward arrays holding the event-level ETmiss and per-event MC weight
-met = data.met     # [GeV]
-mcw = data.mcw     # per-event MC weight
+# Awkward arrays of ETmiss and weights
+met = data.met        # ETmiss per event [GeV]
+weights = data.weight # MC event weight
 
-# Build a weighted histogram for ETmiss
-# Binning & range chosen as a reasonable default for MET
+# Build a weighted histogram: 50 bins from 0 to 200 GeV
 h = (
     Hist.new
-        .Reg(50, 0.0, 200.0, name="met", label=r"$E_T^{miss}$ [GeV]")
-        .Weight()
+    .Reg(50, 0.0, 200.0, name="met", label=r"$E_T^{\mathrm{miss}}$ [GeV]")
+    .Weight()
 )
 
-# Fill with weights; convert to NumPy for Hist backend while staying array-based (no Python lists)
-h.fill(met=ak.to_numpy(met), weight=ak.to_numpy(mcw))
+# Fill using Awkward -> NumPy conversion (no Python lists)
+h.fill(met=ak.to_numpy(met), weight=ak.to_numpy(weights))
 
-# Plot using ATLAS-like style
+# Plot
 plt.style.use(hep.style.ATLAS)
 fig, ax = plt.subplots()
-
-h.plot(histtype="fill", linewidth=1, edgecolor="gray", label="MC (JZ2), weighted")
+h.plot(histtype="fill", linewidth=1, edgecolor="gray", label="JZ2 (MC weights only)")
+ax.set_xlabel(r"$E_T^{\mathrm{miss}}$ [GeV]")
+ax.set_title("Missing $E_T$")
 ax.legend()
-ax.set_xlabel(r"$E_T^{miss}$ [GeV]")
-ax.set_ylabel("Events")
-ax.set_title(r"Missing $E_T$")
 
-# Optional: annotate what weights were applied
-ax.text(
-    0.98, 0.95,
-    "Weights: mcEventWeight(0)\nNo XS/L scaling",
-    transform=ax.transAxes,
-    ha="right", va="top", fontsize=10
-)
-
+# Save plot
 fig.savefig("etmiss.png")
 plt.close(fig)
 ```
@@ -119,37 +115,37 @@ ce8f13a8c0b6: Pulling fs layer
 8f2cf14ad14d: Pulling fs layer
 660b8664e6e1: Pulling fs layer
 eb522b4f7276: Pulling fs layer
+2a1478e0415a: Waiting
 235451d01566: Waiting
 a0831920243c: Waiting
 4f4fb700ef54: Waiting
 ce8f13a8c0b6: Waiting
-660b8664e6e1: Waiting
 8f2cf14ad14d: Waiting
-8fdd7df8e834: Waiting
-2a1478e0415a: Waiting
+660b8664e6e1: Waiting
 eb522b4f7276: Waiting
+8fdd7df8e834: Waiting
 0f40319da806: Verifying Checksum
 0f40319da806: Download complete
 081f96d6584f: Verifying Checksum
 081f96d6584f: Download complete
 8fdd7df8e834: Verifying Checksum
 8fdd7df8e834: Download complete
-2a1478e0415a: Verifying Checksum
-2a1478e0415a: Download complete
 59e22667830b: Verifying Checksum
 59e22667830b: Download complete
+2a1478e0415a: Verifying Checksum
+2a1478e0415a: Download complete
 a0831920243c: Verifying Checksum
 a0831920243c: Download complete
+4f4fb700ef54: Verifying Checksum
 4f4fb700ef54: Download complete
 ce8f13a8c0b6: Verifying Checksum
 ce8f13a8c0b6: Download complete
-660b8664e6e1: Verifying Checksum
-660b8664e6e1: Download complete
-eb522b4f7276: Download complete
 235451d01566: Verifying Checksum
 235451d01566: Download complete
-8f2cf14ad14d: Verifying Checksum
-8f2cf14ad14d: Download complete
+660b8664e6e1: Verifying Checksum
+660b8664e6e1: Download complete
+eb522b4f7276: Verifying Checksum
+eb522b4f7276: Download complete
 59e22667830b: Pull complete
 0f40319da806: Pull complete
 081f96d6584f: Pull complete
@@ -159,6 +155,8 @@ eb522b4f7276: Download complete
 a0831920243c: Pull complete
 4f4fb700ef54: Pull complete
 ce8f13a8c0b6: Pull complete
+8f2cf14ad14d: Verifying Checksum
+8f2cf14ad14d: Download complete
 8f2cf14ad14d: Pull complete
 660b8664e6e1: Pull complete
 eb522b4f7276: Pull complete
@@ -183,14 +181,14 @@ bash: no job control in this shell
 ### LLM Usage
 | Step | Time (sec) | Prompt Tokens | Completion Tokens | Total Tokens | Cost (USD) |
 |---|---|---|---|---|---|
-| Run 1 | 55.44 | 14646 | 2838 | 17484 | $0.05 |
-| **Total** | 55.44 | 14646 | 2838 | 17484 | $0.047 |
+| Run 1 | 70.78 | 14991 | 3346 | 18337 | $0.05 |
+| **Total** | 70.78 | 14991 | 3346 | 18337 | $0.052 |
 
 ### Docker Usage
 | Phase | Elapsed Time (seconds) |
 |-------|--------------|
-| Run 1 | 43.41 |
-| **Total** | **43.41** |
+| Run 1 | 46.58 |
+| **Total** | **46.58** |
 
 </div></details>
 
@@ -198,8 +196,8 @@ bash: no job control in this shell
 ## CSV
 
 Model,Time,PromptTokens,CompletionTokens,TotalTokens,EstimatedCost,Attempts,CodeTime,Result
-gpt-5,55.44,14646,2838,17484,0.047,1,43.41,Success
+gpt-5,70.78,14991,3346,18337,0.052,1,46.58,Success
 ## Summary
 | Model | Time | Prompt Tokens | Completion Tokens | Total Tokens | Estimated Cost | Attempts | Code Time | Result |
 |-----|----|-------------|-----------------|------------|--------------|--------|---------|------|
-| gpt-5 | 55.44 | 14646 | 2838 | 17484 | $0.047 | 1 | 43.41 | Success |
+| gpt-5 | 70.78 | 14991 | 3346 | 18337 | $0.052 | 1 | 46.58 | Success |
