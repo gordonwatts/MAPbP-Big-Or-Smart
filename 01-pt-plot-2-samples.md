@@ -6,76 +6,71 @@
 <div style="margin-left: 1em;">
 
 
-- Fetches both requested PHYSLITE datasets via one ServiceX deliver call (NFiles=1 for each sample), returning only what’s needed: per-event jet pT (in GeV) and the event MC weight.
-- Computes the leading-jet pT per event with Awkward (no Python loops), then selects events with 100 ≤ pT < 200 GeV.
-- Applies MC event weights and cross-section scaling for each dataset, scaled to L = 1 fb^-1:
-  - JZ2 (801167): σ = 2.5826e9 pb
-  - JZ3 (801168): σ = 2.8528e7 pb
-- Builds a weighted, stacked histogram (process categories = JZ2, JZ3) of the leading-jet pT between 100 and 200 GeV using Hist and plots it with mplhep’s ATLAS style.
-- Saves the plot to leading_jet_pt_stacked.png.
-- Note: Only one file per dataset is processed (NFiles=1). Increase NFiles yourself when you are ready.
+- Fetches both requested mc23 PHYSLITE datasets via a single ServiceX delivery (NFiles=1 for each; you can increase later when ready).
+- Skims only what’s needed from ServiceX: per-event mcEventWeight(0) and jet pT>50 GeV (converted to GeV at the source).
+- Uses Awkward to compute the leading-jet pT per event and applies the 100–200 GeV selection.
+- Applies MC event weights and cross-section scaling to L=1.0 fb^-1 using the provided table:
+  - 801167 (JZ2): 2,582,600,000.0 pb
+  - 801168 (JZ3): 28,528,000.0 pb
+- Builds a weighted, stacked histogram (Hist) of leading-jet pT and saves to PNG.
 
 ```python
 import awkward as ak
-from servicex import deliver, ServiceXSpec, Sample, dataset
-from servicex_analysis_utils import to_awk
-from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
-
-from hist import Hist
 import numpy as np
 import matplotlib.pyplot as plt
 import mplhep as hep
+from hist import Hist
+
+from func_adl_servicex_xaodr25 import FuncADLQueryPHYSLITE
+from servicex_analysis_utils import to_awk
+from servicex import deliver, ServiceXSpec, Sample, dataset
+
+plt.style.use(hep.style.ATLAS)
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-# Datasets (Rucio DIDs)
+# Datasets (copy-pasted exactly as requested)
 ds_jz2 = "mc23_13p6TeV:mc23_13p6TeV.801167.Py8EG_A14NNPDF23LO_jj_JZ2.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
 ds_jz3 = "mc23_13p6TeV:mc23_13p6TeV.801168.Py8EG_A14NNPDF23LO_jj_JZ3.deriv.DAOD_PHYSLITE.e8514_e8528_a911_s4114_r15224_r15225_p6697"
 
-# Physics and plotting parameters
-pt_low, pt_high = 100.0, 200.0  # GeV
-n_bins = 50
-L_fb = 1.0  # integrated luminosity used for MC scaling, in fb^-1
+# Target luminosity in fb^-1
+L_target_fb = 1.0
 
-# Known cross sections (pb)
+# Cross-sections from the provided table (pb)
 xsec_pb = {
     "JZ2": 2_582_600_000.0,  # 801167
-    "JZ3":    28_528_000.0,  # 801168
+    "JZ3": 28_528_000.0,     # 801168
 }
 
+# Convert cross-sections to fb (1 pb = 1e3 fb)
+xsec_fb = {k: v * 1.0e3 for k, v in xsec_pb.items()}
+
 # ----------------------------------------------------------------------
-# Build one query to use for both datasets
-#  - Return per-event list of jet pts (in GeV)
-#  - Return per-event MC event weight
-#  - Filter jets at ServiceX level to pt > 100 GeV to minimize egress
+# Build the ServiceX query: per-event mc weight and jet pt list (>50 GeV) in GeV
 # ----------------------------------------------------------------------
-base = FuncADLQueryPHYSLITE()
+base_query = FuncADLQueryPHYSLITE()
+
 query = (
-    base
+    base_query
     .Select(lambda e: {
-        "jets": e.Jets(),  # collection
-        "w": e.EventInfo("EventInfo").mcEventWeight(0)  # scalar per event
-    })
-    .Select(lambda d: {
-        "jet_pt": d.jets
-                     .Where(lambda j: j.pt()/1000.0 > 100.0)  # only jets with pt > 100 GeV
-                     .Select(lambda j: j.pt()/1000.0),        # convert to GeV
-        "event_weight": d.w
+        "mc_weight": e.EventInfo("EventInfo").mcEventWeight(0),
+        # Filter jets at the source to reduce data volume (we only care about leading jet >100 GeV later)
+        "jet_pt": e.Jets().Where(lambda j: j.pt() / 1000.0 > 50.0).Select(lambda j: j.pt() / 1000.0),
     })
 )
 
 # ----------------------------------------------------------------------
-# Fetch both datasets in a single deliver call (NFiles=1 each)
+# Deliver both datasets in a single call (NFiles=1 for each)
 # ----------------------------------------------------------------------
-result = to_awk(
+results = to_awk(
     deliver(
         ServiceXSpec(
             Sample=[
                 Sample(
                     Name="JZ2",
                     Dataset=dataset.Rucio(ds_jz2),
-                    NFiles=1,
+                    NFiles=1,  # Always 1 here; increase when you are ready
                     Query=query,
                 ),
                 Sample(
@@ -89,86 +84,107 @@ result = to_awk(
     )
 )
 
-data_jz2 = result["JZ2"]
-data_jz3 = result["JZ3"]
+data_jz2 = results["JZ2"]
+data_jz3 = results["JZ3"]
 
 # ----------------------------------------------------------------------
-# Helper to compute leading-jet pt per event and scaled event weights
+# Awkward processing: leading-jet pT per event and selection 100–200 GeV
 # ----------------------------------------------------------------------
-def leading_pt_and_scaled_weights(per_event_pts, per_event_w, label):
-    # Sum of MC event weights over all events (before any cuts)
-    sumw = ak.sum(per_event_w)
+def leading_pt_in_window(arr, pt_min=100.0, pt_max=200.0):
+    jet_pts = arr["jet_pt"]       # per-event list of jet pT (GeV)
+    mc_w = arr["mc_weight"]       # per-event MC weight
 
-    # Convert cross section from pb to fb to match L in fb^-1
-    sigma_fb = xsec_pb[label] * 1e3
-    # Scale factor for the entire sample
-    sf = L_fb * sigma_fb / float(sumw)
+    # Find leading jet pT per event
+    # - ak.argmax(..., keepdims=True) returns indices shaped for slicing, with None for empty lists
+    lead_idx = ak.argmax(jet_pts, axis=1, keepdims=True)
+    lead_pt = ak.firsts(jet_pts[lead_idx])  # None if no jets in event
 
-    # Find index of max-pt jet per event
-    # Returns [[idx], [None], ...] with keepdims=True to align for slicing
-    max_idx = ak.argmax(per_event_pts, axis=1, keepdims=True)
+    # Build selection mask for the requested pT window
+    mask = (~ak.is_none(lead_pt)) & (lead_pt >= pt_min) & (lead_pt < pt_max)
 
-    # Select the leading pt per event (None where no jets >100 GeV were found)
-    leading_pt = per_event_pts[max_idx]
-    leading_pt = ak.flatten(leading_pt)  # 1D, may include None's
+    # Selected leading pT and corresponding original MC weights
+    sel_pt = lead_pt[mask]
+    sel_w = mc_w[mask]
+    return sel_pt, sel_w, mc_w  # also return all mc weights to compute normalization sum
 
-    # Build mask: valid leading jet and within requested pT range [100, 200)
-    valid_mask = ~ak.is_none(leading_pt)
-    leading_pt = leading_pt[valid_mask]
-    w = per_event_w[valid_mask] * sf
-
-    in_range = (leading_pt >= pt_low) & (leading_pt < pt_high)
-    return leading_pt[in_range], w[in_range]
-
-# Compute leading-pt and scaled weights for JZ2 and JZ3
-jz2_pt, jz2_w = leading_pt_and_scaled_weights(data_jz2["jet_pt"], data_jz2["event_weight"], "JZ2")
-jz3_pt, jz3_w = leading_pt_and_scaled_weights(data_jz3["jet_pt"], data_jz3["event_weight"], "JZ3")
+# Process both datasets
+sel_pt_jz2, sel_w_jz2, mcw_all_jz2 = leading_pt_in_window(data_jz2, 100.0, 200.0)
+sel_pt_jz3, sel_w_jz3, mcw_all_jz3 = leading_pt_in_window(data_jz3, 100.0, 200.0)
 
 # ----------------------------------------------------------------------
-# Build a stacked histogram with categorical axis for process
+# Compute normalization factors (sum over ALL events, before any cuts)
+# sf = L * sigma / sum_w
+# ----------------------------------------------------------------------
+sumw_jz2 = float(ak.sum(mcw_all_jz2))
+sumw_jz3 = float(ak.sum(mcw_all_jz3))
+
+sf_jz2 = (L_target_fb * xsec_fb["JZ2"]) / sumw_jz2 if sumw_jz2 != 0.0 else 0.0
+sf_jz3 = (L_target_fb * xsec_fb["JZ3"]) / sumw_jz3 if sumw_jz3 != 0.0 else 0.0
+
+print(f"Normalization:")
+print(f"  JZ2: sum_w(all events) = {sumw_jz2:.6g}, xsec = {xsec_pb['JZ2']} pb, scale factor = {sf_jz2:.6g}")
+print(f"  JZ3: sum_w(all events) = {sumw_jz3:.6g}, xsec = {xsec_pb['JZ3']} pb, scale factor = {sf_jz3:.6g}")
+
+# Apply scale factors to selected events' weights
+w_jz2 = ak.to_numpy(sel_w_jz2 * sf_jz2)
+w_jz3 = ak.to_numpy(sel_w_jz3 * sf_jz3)
+pt_jz2 = ak.to_numpy(sel_pt_jz2)
+pt_jz3 = ak.to_numpy(sel_pt_jz3)
+
+# ----------------------------------------------------------------------
+# Make a stacked histogram with Hist
 # ----------------------------------------------------------------------
 h = (
     Hist.new
-        .Reg(n_bins, pt_low, pt_high, name="pt", label="Leading jet $p_{T}$ [GeV]")
-        .StrCat(["JZ2", "JZ3"], name="process", label="Process")
-        .Weight()
+    .Reg(50, 100.0, 200.0, name="pt", label="Leading jet $p_{T}$ [GeV]")
+    .StrCat([], name="process", label="Process", growth=True)
+    .Weight()
 )
 
-# Fill per-process
-h.fill(pt=jz2_pt, process="JZ2", weight=jz2_w)
-h.fill(pt=jz3_pt, process="JZ3", weight=jz3_w)
+# Fill per process
+h.fill(pt=pt_jz2, process="JZ2", weight=w_jz2)
+h.fill(pt=pt_jz3, process="JZ3", weight=w_jz3)
+
+# Prepare slices for plotting
+h_jz2 = h[:, "JZ2"]
+h_jz3 = h[:, "JZ3"]
 
 # ----------------------------------------------------------------------
-# Plot and save
+# Plot (stacked) and save
 # ----------------------------------------------------------------------
-plt.style.use(hep.style.ATLAS)
 fig, ax = plt.subplots()
-# Stacked filled histogram by the categorical axis
-h.plot(stack=True, histtype="fill", ax=ax)
 
-ax.set_xlim(pt_low, pt_high)
-ax.set_xlabel("Leading jet $p_{T}$ [GeV]")
-ax.set_title("Leading jet $p_{T}$ (100–200 GeV)")
-ax.legend(title="Samples")
-
-# Annotate the luminosity and note on weights
-ax.text(
-    0.02, 0.95,
-    f"ATLAS Internal\nL = {L_fb:.1f} fb$^{{-1}}$\nMC weights + cross-section scaling",
-    transform=ax.transAxes,
-    va="top",
+# Use mplhep to draw histograms stacked; Hist provides edges and values
+hep.histplot(
+    [h_jz2, h_jz3],
+    stack=True,
+    histtype="fill",
+    label=["JZ2", "JZ3"],
+    ax=ax,
 )
+
+ax.legend()
+ax.set_xlabel("Leading jet $p_{T}$ [GeV]")
+ax.set_ylabel("Events")
+ax.set_title("Leading jet $p_{T}$")
+ax.text(0.02, 0.98, f"L={L_target_fb:.1f} fb$^{{-1}}$", transform=ax.transAxes, ha="left", va="top")
 
 fig.savefig("leading_jet_pt_stacked.png")
 plt.close(fig)
+
+print("Saved plot to leading_jet_pt_stacked.png")
 ```
 ### stdout:
 
 ```text
-JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:20
+JZ2: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:21
       Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
 JZ3: Transform ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:20
       Download ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1/1 00:25
+Normalization:
+  JZ2: sum_w(all events) = 11.078, xsec = 2582600000.0 pb, scale factor = 2.33128e+11
+  JZ3: sum_w(all events) = 0.440641, xsec = 28528000.0 pb, scale factor = 6.4742e+10
+Saved plot to leading_jet_pt_stacked.png
 **Success**
 
 ```
@@ -190,41 +206,42 @@ ce8f13a8c0b6: Pulling fs layer
 8f2cf14ad14d: Pulling fs layer
 660b8664e6e1: Pulling fs layer
 eb522b4f7276: Pulling fs layer
-8f2cf14ad14d: Waiting
-660b8664e6e1: Waiting
-a0831920243c: Waiting
-eb522b4f7276: Waiting
-4f4fb700ef54: Waiting
-2a1478e0415a: Waiting
 8fdd7df8e834: Waiting
 ce8f13a8c0b6: Waiting
+8f2cf14ad14d: Waiting
+2a1478e0415a: Waiting
+235451d01566: Waiting
+4f4fb700ef54: Waiting
+660b8664e6e1: Waiting
+a0831920243c: Waiting
 0f40319da806: Verifying Checksum
 0f40319da806: Download complete
 081f96d6584f: Verifying Checksum
 081f96d6584f: Download complete
+8fdd7df8e834: Verifying Checksum
+8fdd7df8e834: Download complete
+2a1478e0415a: Verifying Checksum
+2a1478e0415a: Download complete
 59e22667830b: Verifying Checksum
 59e22667830b: Download complete
-8fdd7df8e834: Download complete
-2a1478e0415a: Download complete
 a0831920243c: Verifying Checksum
 a0831920243c: Download complete
 4f4fb700ef54: Verifying Checksum
 4f4fb700ef54: Download complete
 ce8f13a8c0b6: Verifying Checksum
 ce8f13a8c0b6: Download complete
-59e22667830b: Pull complete
-0f40319da806: Pull complete
-660b8664e6e1: Verifying Checksum
+235451d01566: Verifying Checksum
+235451d01566: Download complete
 660b8664e6e1: Download complete
 eb522b4f7276: Verifying Checksum
 eb522b4f7276: Download complete
+8f2cf14ad14d: Verifying Checksum
+8f2cf14ad14d: Download complete
+59e22667830b: Pull complete
+0f40319da806: Pull complete
 081f96d6584f: Pull complete
 8fdd7df8e834: Pull complete
 2a1478e0415a: Pull complete
-235451d01566: Verifying Checksum
-235451d01566: Download complete
-8f2cf14ad14d: Verifying Checksum
-8f2cf14ad14d: Download complete
 235451d01566: Pull complete
 a0831920243c: Pull complete
 4f4fb700ef54: Pull complete
@@ -253,14 +270,14 @@ bash: no job control in this shell
 ### LLM Usage
 | Step | Time (sec) | Prompt Tokens | Completion Tokens | Total Tokens | Cost (USD) |
 |---|---|---|---|---|---|
-| Run 1 | 85.47 | 14722 | 4833 | 19555 | $0.07 |
-| **Total** | 85.47 | 14722 | 4833 | 19555 | $0.067 |
+| Run 1 | 158.81 | 15067 | 7172 | 22239 | $0.09 |
+| **Total** | 158.81 | 15067 | 7172 | 22239 | $0.091 |
 
 ### Docker Usage
 | Phase | Elapsed Time (seconds) |
 |-------|--------------|
-| Run 1 | 45.62 |
-| **Total** | **45.62** |
+| Run 1 | 47.30 |
+| **Total** | **47.30** |
 
 </div></details>
 
@@ -268,8 +285,8 @@ bash: no job control in this shell
 ## CSV
 
 Model,Time,PromptTokens,CompletionTokens,TotalTokens,EstimatedCost,Attempts,CodeTime,Result
-gpt-5,85.47,14722,4833,19555,0.067,1,45.62,Success
+gpt-5,158.81,15067,7172,22239,0.091,1,47.30,Success
 ## Summary
 | Model | Time | Prompt Tokens | Completion Tokens | Total Tokens | Estimated Cost | Attempts | Code Time | Result |
 |-----|----|-------------|-----------------|------------|--------------|--------|---------|------|
-| gpt-5 | 85.47 | 14722 | 4833 | 19555 | $0.067 | 1 | 45.62 | Success |
+| gpt-5 | 158.81 | 15067 | 7172 | 22239 | $0.091 | 1 | 47.30 | Success |
